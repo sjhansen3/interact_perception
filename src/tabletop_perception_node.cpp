@@ -17,20 +17,23 @@
 #include <geometry_msgs/TransformStamped.h>
 #include <geometry_msgs/Twist.h>
 
-
-// #include <iostream>
-// #include <pcl/io/pcd_io.h>
 #include <pcl/filters/extract_indices.h>
+#include <pcl/filters/statistical_outlier_removal.h>
+
+#include <dynamic_reconfigure/server.h>
+#include <interact_perception/tabletopPerceptionParamConfig.h>
 
 
 
 class TableTopPerception
 {
 public:
+    typedef interact_perception::tabletopPerceptionParamConfig DynamicReconfigureType;
+
     TableTopPerception(void);
     void run(void);
-
     void pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg);
+    void dyn_data_callback(DynamicReconfigureType &config, uint32_t level); 
 
 private:
     typedef pcl::PointXYZ PointType;
@@ -40,8 +43,18 @@ private:
     tf2_ros::TransformListener m_tfListener;
     ros::NodeHandle m_nh;
     ros::Publisher m_pc_pub;
+    ros::Publisher m_pc_plane_pub;
+
     ros::Subscriber m_pc_sub;
 
+    dynamic_reconfigure::Server<DynamicReconfigureType> m_server;
+    dynamic_reconfigure::Server<DynamicReconfigureType>::CallbackType m_f;
+
+    double m_paramPlaneDistThresh;
+    bool m_paramSetPlaneExtractNeg;
+    int m_paramStatisticFilterMeanK;
+    double m_paramStddevMulThresh;
+    float m_paramVoxelDownSampleLeafSize;
 };
 
 TableTopPerception::TableTopPerception()
@@ -49,7 +62,30 @@ TableTopPerception::TableTopPerception()
 {
     //tf2::TransformListener tfListener(TableTopPerception::tfBuffer);
     m_pc_pub = m_nh.advertise<sensor_msgs::PointCloud2>("/tabletop_perception/cloud_filtered", 10);
+    m_pc_plane_pub = m_nh.advertise<sensor_msgs::PointCloud2>("/tabletop_perception/plane", 10);
+
     m_pc_sub = m_nh.subscribe("/zed/point_cloud/cloud_registered", 10, &TableTopPerception::pc_callback, this);
+
+    m_f = boost::bind(&TableTopPerception::dyn_data_callback,this, _1, _2);
+    m_server.setCallback(m_f);
+
+    //set initial parameters, can be changed using dynParam
+    m_paramPlaneDistThresh = 0.02;
+    m_paramSetPlaneExtractNeg = true;
+    m_paramStatisticFilterMeanK = 50;
+    m_paramStddevMulThresh = 1;
+    m_paramVoxelDownSampleLeafSize = 0.005;
+
+}
+
+void TableTopPerception::dyn_data_callback(interact_perception::tabletopPerceptionParamConfig &config, uint32_t level) 
+{
+  ROS_INFO("Reconfigure Request: %d %f %s %s %d", 
+            config.int_param, config.double_param, 
+            config.str_param.c_str(), 
+            config.bool_param?"True":"False", 
+            config.size);
+
 }
 
 void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg)
@@ -97,10 +133,18 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
     ROS_INFO_STREAM("Before filtering: " << cloud_filtered->width * cloud_filtered->height);
     pcl::VoxelGrid<PointType> filter_voxel;
     filter_voxel.setInputCloud(cloud_filtered);
-    filter_voxel.setLeafSize (0.005f, 0.005f, 0.005f);
+    filter_voxel.setLeafSize (m_paramVoxelDownSampleLeafSize, m_paramVoxelDownSampleLeafSize, m_paramVoxelDownSampleLeafSize);
     filter_voxel.filter(*cloud_filtered);
     ROS_INFO_STREAM("After filtering: " << cloud_filtered->width * cloud_filtered->height);
 
+    // Create the filtering object
+    pcl::StatisticalOutlierRemoval<PointType> sor;
+    sor.setInputCloud (cloud_filtered);
+    sor.setMeanK (m_paramStatisticFilterMeanK);
+    sor.setStddevMulThresh (m_paramStddevMulThresh);
+    sor.filter (*cloud_filtered);
+
+    //////// Plane Segmentation ////////////
     pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients ());
     pcl::PointIndices::Ptr inliers (new pcl::PointIndices ());
 
@@ -111,49 +155,46 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
     seg.setModelType (pcl::SACMODEL_PLANE);
     seg.setMethodType (pcl::SAC_RANSAC);
     seg.setMaxIterations (1000);
-    seg.setDistanceThreshold (0.01);
+    seg.setDistanceThreshold (m_paramPlaneDistThresh);
 
     //create the filtering object
     pcl::ExtractIndices<PointType> extract;
-    int i = 0, nr_points = (int) cloud_filtered->points.size ();
+    //int i = 0, nr_points = (int) cloud_filtered->points.size ();
 
     //while 30% of the original cloud is still there
-    while (cloud_filtered->points.size () > 0.3 * nr_points)
+    // while (cloud_filtered->points.size () > 0.3 * nr_points)
+    // {
+    //segment the largest planer component from the remaining cloud
+    seg.setInputCloud(cloud_filtered);
+    seg.segment(*inliers, *coefficients);
+    if (inliers->indices.size () == 0)
     {
-        //segment the largest planer component from the remaining cloud
-        seg.setInputCloud(cloud_filtered);
-        seg.segment(*inliers, *coefficients);
-        if (inliers->indices.size () == 0)
-        {
-            ROS_ERROR_STREAM("Could not estimate a planar model for the given dataset.");
-            break;
-        }
-        
-        // Extract the inliers
-        extract.setInputCloud (cloud_filtered);
-        extract.setIndices (inliers);
-        extract.setNegative (false);
-        extract.filter (*cloud_p);
-
-        ROS_INFO_STREAM("PointCloud representing the planar component: " << cloud_p->width * cloud_p->height << " data points." );
-
-        std::stringstream ss;
-        ss << "interact_scene_plane_" << i;
-
-        //convert to message
-        sensor_msgs::PointCloud2 msg_p;
-        pcl::toROSMsg(*cloud_p, msg_p);
-        msg_p.header.frame_id = "world";
-
-        //publish pc
-        m_pc_plane_pub.publish(msg_p);
-
-        // Create the filtering object
-        extract.setNegative (true);
-        extract.filter (*cloud_f);
-        cloud_filtered.swap (cloud_f);
-        i++;
+        ROS_ERROR_STREAM("Could not estimate a planar model for the given dataset.");
+        // break;
     }
+    
+    // Extract the inliers
+    extract.setInputCloud (cloud_filtered);
+    extract.setIndices (inliers);
+    extract.setNegative (m_paramSetPlaneExtractNeg);
+    extract.filter (*cloud_p);
+
+    ROS_INFO_STREAM("PointCloud representing the planar component: " << cloud_p->width * cloud_p->height << " data points." );
+
+    //convert to message
+    sensor_msgs::PointCloud2 msg_p;
+    pcl::toROSMsg(*cloud_p, msg_p);
+    msg_p.header.frame_id = "world";
+
+    //publish pc
+    m_pc_plane_pub.publish(msg_p);
+
+    // Find the points that arn't in the plane and set cloud filtered to them for the next iteration
+    // extract.setNegative (true);
+    // extract.filter (*cloud_f);
+    // cloud_filtered.swap (cloud_f);
+    // i++;
+    // }
 
     //convert to message
     sensor_msgs::PointCloud2 msg_filtered;
