@@ -54,7 +54,16 @@ private:
     bool m_paramSetPlaneExtractNeg;
     int m_paramStatisticFilterMeanK;
     double m_paramStddevMulThresh;
-    float m_paramVoxelDownSampleLeafSize;
+    double m_paramVoxelDownSampleLeafSize;
+
+    double m_paramXMaskMin;
+    double m_paramXMaskMax;
+
+    double m_paramYMaskMin;
+    double m_paramYMaskMax;
+
+    double m_paramZMaskMin;
+    double m_paramZMaskMax;
 };
 
 TableTopPerception::TableTopPerception()
@@ -76,15 +85,40 @@ TableTopPerception::TableTopPerception()
     m_paramStddevMulThresh = 1;
     m_paramVoxelDownSampleLeafSize = 0.005;
 
+    m_paramXMaskMin = -1.32;
+    m_paramXMaskMax = 0.3;
+
+    m_paramYMaskMin = -0.3;
+    m_paramYMaskMax = 0.5;
+
+    m_paramZMaskMin = -2;
+    m_paramZMaskMax = 10;
+
 }
 
 void TableTopPerception::dyn_data_callback(interact_perception::tabletopPerceptionParamConfig &config, uint32_t level) 
 {
-  ROS_INFO("Reconfigure Request: %d %f %s %s %d", 
-            config.int_param, config.double_param, 
-            config.str_param.c_str(), 
-            config.bool_param?"True":"False", 
-            config.size);
+  ROS_INFO("Reconfigure Request: PlaneDist, %f PlaneExtract, %s FilterK, %d StdDev, %f  VoxelSize, %f", 
+            config.paramPlaneDistThresh,
+            config.paramSetPlaneExtractNeg?"True":"False", 
+            config.paramStatisticFilterMeanK, 
+            config.paramStddevMulThresh,
+            config.paramVoxelDownSampleLeafSize);
+
+    m_paramPlaneDistThresh = config.paramPlaneDistThresh;
+    m_paramSetPlaneExtractNeg = config.paramSetPlaneExtractNeg;
+    m_paramStatisticFilterMeanK = config.paramStatisticFilterMeanK;
+    m_paramStddevMulThresh = config.paramStddevMulThresh;
+    m_paramVoxelDownSampleLeafSize = config.paramVoxelDownSampleLeafSize;
+
+    m_paramXMaskMin = config.paramXMaskMin;
+    m_paramXMaskMax = config.paramXMaskMax;
+
+    m_paramYMaskMin = config.paramYMaskMin;
+    m_paramYMaskMax = config.paramYMaskMax;
+
+    m_paramZMaskMin = config.paramZMaskMin;
+    m_paramZMaskMax = config.paramZMaskMax;
 
 }
 
@@ -95,13 +129,11 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
     pcl::PointCloud<PointType>::Ptr cloud_filtered(new pcl::PointCloud<PointType>);
 
     pcl::PointCloud<PointType>::Ptr cloud_p(new pcl::PointCloud<PointType>);
-    pcl::PointCloud<PointType>::Ptr cloud_f(new pcl::PointCloud<PointType>);
 
     pcl::fromROSMsg(*msg, *cloud);
-    // Eigen::Affine3f transform_2 = Eigen::Affine3f::Identity();
+
     try{
         m_transformation = m_tfBuffer.lookupTransform("world", "zed_center", ros::Time(0));
-        //tfBuffer.lookupTransform()
     }
     catch (tf2::TransformException &ex) {
         ROS_WARN("%s", ex.what());
@@ -110,39 +142,44 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
     Eigen::Affine3d world_to_map = tf2::transformToEigen(m_transformation);
 
     ROS_INFO_STREAM("Transformation: " << m_transformation);
-    // ROS_INFO_STREAM("World to map: " << world_to_map);
-
     pcl::PointCloud<PointType>::Ptr transformed_cloud (new pcl::PointCloud<PointType> ());
     pcl::transformPointCloud (*cloud, *transformed_cloud, world_to_map);
 
-    pcl::PassThrough<PointType> filter_x, filter_y;
+    pcl::PassThrough<PointType> filter_x, filter_y, filter_z;
 
-    // Filter in x
+    //mask in x
     filter_x.setInputCloud(transformed_cloud);
     filter_x.setFilterFieldName("x");
-    filter_x.setFilterLimits(-1.32, 0.3);
+    filter_x.setFilterLimits(m_paramXMaskMin, m_paramXMaskMax);
     filter_x.filter(*cloud_filtered);
 
     //Filter in y
     filter_y.setInputCloud(cloud_filtered);
     filter_y.setFilterFieldName("y");
-    filter_y.setFilterLimits(-0.3, 0.5);
+    filter_y.setFilterLimits(m_paramYMaskMin, m_paramYMaskMax);
     filter_y.filter(*cloud_filtered);
+
+    //Filter in z
+    filter_z.setInputCloud(cloud_filtered);
+    filter_z.setFilterFieldName("z");
+    filter_z.setFilterLimits(m_paramZMaskMin, m_paramZMaskMax);
+    filter_z.filter(*cloud_filtered);
+
+    // Create the filtering object
+    // pcl::StatisticalOutlierRemoval<PointType> sor;
+    // sor.setInputCloud (cloud_filtered);
+    // sor.setMeanK (m_paramStatisticFilterMeanK);
+    // sor.setStddevMulThresh (m_paramStddevMulThresh);
+    // sor.filter (*cloud_filtered);
 
     //downsample the dataset using leaf size of 1cm
     ROS_INFO_STREAM("Before filtering: " << cloud_filtered->width * cloud_filtered->height);
     pcl::VoxelGrid<PointType> filter_voxel;
     filter_voxel.setInputCloud(cloud_filtered);
-    filter_voxel.setLeafSize (m_paramVoxelDownSampleLeafSize, m_paramVoxelDownSampleLeafSize, m_paramVoxelDownSampleLeafSize);
+    //TODO ask to check this
+    filter_voxel.setLeafSize ((float) m_paramVoxelDownSampleLeafSize,(float) m_paramVoxelDownSampleLeafSize,(float) m_paramVoxelDownSampleLeafSize);
     filter_voxel.filter(*cloud_filtered);
     ROS_INFO_STREAM("After filtering: " << cloud_filtered->width * cloud_filtered->height);
-
-    // Create the filtering object
-    pcl::StatisticalOutlierRemoval<PointType> sor;
-    sor.setInputCloud (cloud_filtered);
-    sor.setMeanK (m_paramStatisticFilterMeanK);
-    sor.setStddevMulThresh (m_paramStddevMulThresh);
-    sor.filter (*cloud_filtered);
 
     //////// Plane Segmentation ////////////
     pcl::ModelCoefficients::Ptr coefficients (new pcl::ModelCoefficients ());
@@ -159,11 +196,7 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
 
     //create the filtering object
     pcl::ExtractIndices<PointType> extract;
-    //int i = 0, nr_points = (int) cloud_filtered->points.size ();
 
-    //while 30% of the original cloud is still there
-    // while (cloud_filtered->points.size () > 0.3 * nr_points)
-    // {
     //segment the largest planer component from the remaining cloud
     seg.setInputCloud(cloud_filtered);
     seg.segment(*inliers, *coefficients);
@@ -188,13 +221,6 @@ void TableTopPerception::pc_callback(const sensor_msgs::PointCloud2ConstPtr &msg
 
     //publish pc
     m_pc_plane_pub.publish(msg_p);
-
-    // Find the points that arn't in the plane and set cloud filtered to them for the next iteration
-    // extract.setNegative (true);
-    // extract.filter (*cloud_f);
-    // cloud_filtered.swap (cloud_f);
-    // i++;
-    // }
 
     //convert to message
     sensor_msgs::PointCloud2 msg_filtered;
